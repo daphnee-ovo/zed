@@ -5,6 +5,9 @@ pub mod outline;
 mod pattern_extraction;
 mod sandboxing;
 mod templates;
+
+#[cfg(test)]
+mod system_prompt_override_tests;
 #[cfg(test)]
 mod tests;
 mod thread;

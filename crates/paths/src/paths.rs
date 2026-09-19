@@ -325,6 +325,15 @@ pub fn agents_file() -> &'static PathBuf {
     AGENTS_FILE.get_or_init(|| config_dir().join("AGENTS.md"))
 }
 
+/// Returns the path to the user-global system prompt override.
+///
+/// When this file exists, the native Zed agent renders it instead of the
+/// built-in system prompt.
+pub fn system_prompt_file() -> &'static PathBuf {
+    static SYSTEM_PROMPT_FILE: OnceLock<PathBuf> = OnceLock::new();
+    SYSTEM_PROMPT_FILE.get_or_init(|| config_dir().join("system_prompt.hbs"))
+}
+
 /// User-facing display form of the user-global `AGENTS.md` file path —
 /// i.e. what a human should see in messages and prompts, with the
 /// platform's native path separator and home/config directory shorthand.

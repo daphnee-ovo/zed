@@ -1,5 +1,9 @@
 mod agent_profile;
+mod system_prompt_override;
 mod user_agents_md;
+
+#[cfg(test)]
+mod system_prompt_override_tests;
 
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::fmt;
@@ -24,6 +28,9 @@ use settings::{
 use util::ResultExt as _;
 
 pub use crate::agent_profile::*;
+pub use crate::system_prompt_override::{
+    SystemPromptOverride, SystemPromptOverrideState, init as init_system_prompt_override,
+};
 pub use crate::user_agents_md::{UserAgentsMd, UserAgentsMdState, init as init_user_agents_md};
 
 pub const SUMMARIZE_THREAD_PROMPT: &str = include_str!("prompts/summarize_thread_prompt.txt");

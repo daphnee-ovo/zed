@@ -15,7 +15,9 @@ pub mod visual_tests;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
 
-use agent_settings::{UserAgentsMdState, init_user_agents_md};
+use agent_settings::{
+    SystemPromptOverrideState, UserAgentsMdState, init_system_prompt_override, init_user_agents_md,
+};
 use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
 pub use app_menus::*;
@@ -2095,6 +2097,33 @@ pub fn watch_user_agents_md(fs: Arc<dyn fs::Fs>, cx: &mut App) {
             let path = paths::agents_file().display().to_string();
             log::error!("Failed to load user AGENTS.md from {path}: {message}");
             let body = format!("Failed to load {path}\n{message}");
+            let notification_id = notification_id.clone();
+            show_app_notification(notification_id, cx, move |cx| {
+                let body = body.clone();
+                cx.new(|cx| MessageNotification::new(body, cx))
+            });
+        }
+    });
+}
+
+/// Watches the user-global native Agent system prompt override and surfaces
+/// errors that prevent Agent requests from starting.
+pub fn watch_system_prompt_override(fs: Arc<dyn fs::Fs>, cx: &mut App) {
+    struct SystemPromptOverrideError;
+    let notification_id = NotificationId::unique::<SystemPromptOverrideError>();
+
+    init_system_prompt_override(fs, cx, move |state, cx| match state {
+        SystemPromptOverrideState::Loading
+        | SystemPromptOverrideState::Loaded(_)
+        | SystemPromptOverrideState::Empty => {
+            dismiss_app_notification(&notification_id, cx);
+        }
+        SystemPromptOverrideState::Error(message) => {
+            let path = paths::system_prompt_file().display().to_string();
+            log::error!("Failed to load system prompt override from {path}: {message}");
+            let body = format!(
+                "Invalid Agent system prompt override at {path}\n{message}\n\nAgent requests are disabled until the file is fixed or deleted."
+            );
             let notification_id = notification_id.clone();
             show_app_notification(notification_id, cx, move |cx| {
                 let body = body.clone();

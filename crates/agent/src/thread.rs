@@ -4,12 +4,12 @@ use crate::{
     DiagnosticsTool, EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
     GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool,
     ProjectSnapshot, ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool,
-    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
+    SystemPromptTemplate, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
     WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
-use agent_settings::UserAgentsMd;
+use agent_settings::{SystemPromptOverride, SystemPromptOverrideState, UserAgentsMd};
 
 use crate::sandboxing::{
     SandboxRequest, ThreadSandbox, ThreadSandboxGrants, sandbox_git_dirs,
@@ -2588,12 +2588,14 @@ impl Thread {
         self.flush_pending_message(cx);
         self.cancel(cx).detach();
 
-        let compaction = self.forced_compaction_target_ix().map(|request_end_ix| {
+        let compaction = if let Some(request_end_ix) = self.forced_compaction_target_ix() {
             self.advance_prompt_id();
-            let request = self.build_compaction_request(request_end_ix, &model, cx);
+            let request = self.build_compaction_request(request_end_ix, &model, cx)?;
             self.current_request_token_usage = TokenUsage::default();
-            (model.clone(), request)
-        });
+            Some((model.clone(), request))
+        } else {
+            None
+        };
 
         if compaction.is_some() {
             self.pending_compaction_telemetry =
@@ -3156,9 +3158,13 @@ impl Thread {
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
         let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
-            let insertion_ix = this.compaction_message_target_ix(cx)?;
-            let model = this.compaction_model(cx)?;
-            let request = this.build_compaction_request(insertion_ix, &model, cx);
+            let Some(insertion_ix) = this.compaction_message_target_ix(cx) else {
+                return anyhow::Ok(None);
+            };
+            let Some(model) = this.compaction_model(cx) else {
+                return anyhow::Ok(None);
+            };
+            let request = this.build_compaction_request(insertion_ix, &model, cx)?;
             this.current_request_token_usage = TokenUsage::default();
             // Preserve telemetry across retries so the retry count keeps
             // accumulating rather than resetting on each attempt.
@@ -3166,8 +3172,8 @@ impl Thread {
                 this.pending_compaction_telemetry =
                     this.build_compaction_telemetry("auto", &model, cx);
             }
-            Some((model, request, insertion_ix))
-        })?
+            anyhow::Ok(Some((model, request, insertion_ix)))
+        })??
         else {
             return Ok(ControlFlow::Continue(()));
         };
@@ -4143,7 +4149,7 @@ impl Thread {
             .unwrap_or_default();
 
         log::debug!("Request includes {} tools", available_tools.len());
-        let messages = self.build_request_messages(available_tools, cx);
+        let messages = self.build_request_messages(available_tools, cx)?;
         log::debug!("Request will include {} messages", messages.len());
 
         let request = LanguageModelRequest {
@@ -4348,15 +4354,15 @@ impl Thread {
         &self,
         available_tools: Vec<SharedString>,
         cx: &App,
-    ) -> Vec<LanguageModelRequestMessage> {
+    ) -> Result<Vec<LanguageModelRequestMessage>> {
         let mut messages =
-            self.build_request_messages_until(available_tools, self.messages.len(), cx);
+            self.build_request_messages_until(available_tools, self.messages.len(), cx)?;
 
         if let Some(message) = self.pending_message.as_ref() {
             messages.extend(message.to_request());
         }
 
-        messages
+        Ok(messages)
     }
 
     fn build_request_messages_until(
@@ -4364,12 +4370,12 @@ impl Thread {
         available_tools: Vec<SharedString>,
         end_ix: usize,
         cx: &App,
-    ) -> Vec<LanguageModelRequestMessage> {
+    ) -> Result<Vec<LanguageModelRequestMessage>> {
         let end_ix = end_ix.min(self.messages.len());
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
-        let system_prompt = SystemPromptTemplate {
+        let system_prompt_context = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
@@ -4381,10 +4387,37 @@ impl Thread {
             ),
             is_linux: cfg!(target_os = "linux"),
             is_windows: cfg!(target_os = "windows"),
-        }
-        .render(&self.templates)
-        .context("failed to build system prompt")
-        .expect("Invalid template");
+        };
+        let override_source = match SystemPromptOverride::global(cx).map(|prompt| prompt.state()) {
+            Some(SystemPromptOverrideState::Loading) => {
+                anyhow::bail!(
+                    "System prompt override is still loading from {}",
+                    paths::system_prompt_file().display()
+                );
+            }
+            Some(SystemPromptOverrideState::Error(error)) => {
+                anyhow::bail!(
+                    "Cannot start Agent because {} is invalid: {error}",
+                    paths::system_prompt_file().display()
+                );
+            }
+            Some(SystemPromptOverrideState::Loaded(source)) => Some(source.as_ref()),
+            Some(SystemPromptOverrideState::Empty) | None => None,
+        };
+        let system_prompt = self
+            .templates
+            .render_system_prompt(&system_prompt_context, override_source)
+            .with_context(|| {
+                override_source.map_or_else(
+                    || "failed to render built-in system prompt".to_string(),
+                    |_| {
+                        format!(
+                            "failed to render system prompt override {}",
+                            paths::system_prompt_file().display()
+                        )
+                    },
+                )
+            })?;
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],
@@ -4397,7 +4430,7 @@ impl Thread {
             last_message.cache = true;
         }
 
-        messages
+        Ok(messages)
     }
 
     fn extend_request_history_until(
@@ -4524,13 +4557,13 @@ impl Thread {
         insertion_ix: usize,
         model: &Arc<dyn LanguageModel>,
         cx: &App,
-    ) -> LanguageModelRequest {
+    ) -> Result<LanguageModelRequest> {
         let mut request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(CompletionIntent::ThreadContextSummarization),
             temperature: AgentSettings::temperature_for_model(model, cx),
-            messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
+            messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx)?,
             ..Default::default()
         };
 
@@ -4541,7 +4574,7 @@ impl Thread {
             reasoning_details: None,
         });
 
-        request
+        Ok(request)
     }
 
     pub fn to_markdown(&self) -> String {
@@ -8239,7 +8272,9 @@ mod tests {
                     "after native",
                 ));
 
-                thread.build_request_messages(Vec::new(), cx)
+                thread
+                    .build_request_messages(Vec::new(), cx)
+                    .expect("build request messages")
             })
         });
 
@@ -8277,7 +8312,9 @@ mod tests {
                     .messages
                     .push(user_text_message(ClientUserMessageId::new(), "after user"));
 
-                thread.build_request_messages(Vec::new(), cx)
+                thread
+                    .build_request_messages(Vec::new(), cx)
+                    .expect("build request messages")
             })
         });
 

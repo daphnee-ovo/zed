@@ -23,6 +23,21 @@ impl Templates {
         handlebars.register_embed_templates::<Assets>().unwrap();
         Arc::new(Self(handlebars))
     }
+
+    pub fn render_system_prompt(
+        &self,
+        context: &SystemPromptTemplate<'_>,
+        override_source: Option<&str>,
+    ) -> Result<String> {
+        let Some(override_source) = override_source else {
+            return context.render(self);
+        };
+
+        let mut handlebars = Handlebars::new();
+        handlebars.set_strict_mode(true);
+        handlebars.register_helper("contains", Box::new(contains));
+        Ok(handlebars.render_template(override_source, context)?)
+    }
 }
 
 pub trait Template: Sized {
