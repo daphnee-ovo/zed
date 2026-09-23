@@ -23,6 +23,30 @@ Create or edit:
 
 On Windows, the equivalent file is under `%APPDATA%\Zed\AGENTS.md`.
 
+## System Prompt Override {#system-prompt-override}
+
+Advanced users can replace the native Zed Agent's complete built-in system
+prompt by creating:
+
+```text
+~/.config/zed/system_prompt.hbs
+```
+
+On Windows, the equivalent file is under
+`%APPDATA%\Zed\system_prompt.hbs`. Removing or emptying the file restores the
+built-in prompt.
+
+The override is a strict Handlebars template. It can use the same context as
+Zed's built-in prompt, including `available_tools`, `model_name`, `date`,
+`user_agents_md`, `worktrees`, `has_rules`, `os`, `arch`, `shell`, `skills`,
+`has_skills`, `sandboxing`, `is_linux`, and `is_windows`. The `contains` helper
+is also available.
+
+The override replaces the complete prompt, so include any tool-use,
+instructions, Skills, project rules, and sandbox guidance that the model still
+needs. If the file cannot be read, parsed, or rendered, Zed displays the error
+and refuses to start Agent requests until the override is fixed or removed.
+
 ## Project Instructions {#project-instructions}
 
 Project instruction files apply to the current project. Zed uses the first matching file in this list:
