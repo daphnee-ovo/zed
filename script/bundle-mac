@@ -3,6 +3,9 @@
 set -euo pipefail
 source script/lib/blob-store.sh
 
+# download_and_unpack runs after download_git changes directories, so keep the repository cache path absolute.
+download_cache_dir="$(pwd)/tmp"
+
 build_flag="--release"
 target_dir="release"
 open_result=false
@@ -147,15 +150,21 @@ function download_and_unpack() {
     local url=$1
     local path_to_unpack=$2
     local target_path=$3
+    local archive_name="${url##*/}"
+    local cached_archive="${download_cache_dir}/${archive_name}"
 
     temp_dir=$(mktemp -d)
 
-    if ! command -v curl &> /dev/null; then
-        echo "curl is not installed. Please install curl to continue."
-        exit 1
-    fi
+    if [[ -f "$cached_archive" ]]; then
+        tar -xvz -C "$temp_dir" -f "$cached_archive" $path_to_unpack
+    else
+        if ! command -v curl &> /dev/null; then
+            echo "curl is not installed. Please install curl to continue."
+            exit 1
+        fi
 
-    curl --silent --fail --location "$url" | tar -xvz -C "$temp_dir" -f - $path_to_unpack
+        curl --silent --fail --location "$url" | tar -xvz -C "$temp_dir" -f - $path_to_unpack
+    fi
 
     mv "$temp_dir/$path_to_unpack" "$target_path"
 
