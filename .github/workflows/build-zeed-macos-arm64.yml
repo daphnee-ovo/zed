@@ -1,0 +1,38 @@
+name: Build Zeed macOS ARM64
+
+on:
+  push:
+    branches:
+      - zeed/release
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 180
+    env:
+      CARGO_INCREMENTAL: 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          targets: aarch64-apple-darwin
+
+      - name: Build macOS ARM64 DMG
+        run: ./script/bundle-mac aarch64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zeed-macos-arm64
+          path: target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+          if-no-files-found: error
