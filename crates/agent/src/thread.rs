@@ -7,7 +7,7 @@ use crate::{
     SystemPromptTemplate, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
     WriteFileTool, decide_permission_from_settings,
 };
-use acp_thread::{ClientUserMessageId, MentionUri};
+use acp_thread::{AgentModelId, ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
 use agent_settings::{SystemPromptOverride, SystemPromptOverrideState, UserAgentsMd};
 
@@ -787,7 +787,12 @@ pub trait ThreadEnvironment {
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>>;
 
-    fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>>;
+    fn create_subagent(
+        &self,
+        label: String,
+        model: Option<AgentModelId>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>>;
 
     fn resume_subagent(
         &self,
@@ -884,6 +889,7 @@ pub struct AvailableAgent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AvailableModel {
     /// Identifier to pass as the `model` field when creating a thread.
+    /// For `spawn_agent`, use a model from the native Zed agent entry.
     pub id: String,
     /// Human-readable name.
     pub name: SharedString,
@@ -1233,13 +1239,13 @@ enum CompletionError {
 }
 
 pub enum ThreadModel {
-    Ready(Arc<dyn LanguageModel>),
+    Ready(LanguageModel),
     Unresolved(SelectedModel),
     Unset,
 }
 
 impl ThreadModel {
-    fn as_model(&self) -> Option<&Arc<dyn LanguageModel>> {
+    fn as_model(&self) -> Option<&LanguageModel> {
         match self {
             Self::Ready(model) => Some(model),
             Self::Unresolved(_) | Self::Unset => None,
@@ -1301,7 +1307,7 @@ pub struct Thread {
     project_context: Entity<ProjectContext>,
     pub(crate) templates: Arc<Templates>,
     model: ThreadModel,
-    summarization_model: Option<Arc<dyn LanguageModel>>,
+    summarization_model: Option<LanguageModel>,
     thinking_enabled: bool,
     thinking_effort: Option<String>,
     speed: Option<Speed>,
@@ -1326,19 +1332,23 @@ pub struct Thread {
 }
 
 impl Thread {
-    fn prompt_capabilities(model: Option<&dyn LanguageModel>) -> acp::PromptCapabilities {
+    fn prompt_capabilities(model: Option<&LanguageModel>) -> acp::PromptCapabilities {
         let image = model.map_or(true, |model| model.supports_images());
         acp::PromptCapabilities::new()
             .image(image)
             .embedded_context(true)
     }
 
-    pub fn new_subagent(parent_thread: &Entity<Thread>, cx: &mut Context<Self>) -> Self {
+    pub fn new_subagent(
+        parent_thread: &Entity<Thread>,
+        model_selection: Option<&LanguageModelSelection>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let project = parent_thread.read(cx).project.clone();
         let project_context = parent_thread.read(cx).project_context.clone();
         let context_server_registry = parent_thread.read(cx).context_server_registry.clone();
         let templates = parent_thread.read(cx).templates.clone();
-        let model = parent_thread.read(cx).model().cloned();
+        let parent_model = parent_thread.read(cx).model().cloned();
         let parent_action_log = parent_thread.read(cx).action_log().clone();
         let action_log =
             cx.new(|_cx| ActionLog::new(project.clone()).with_linked_action_log(parent_action_log));
@@ -1347,7 +1357,7 @@ impl Thread {
             project_context,
             context_server_registry,
             templates,
-            model,
+            parent_model,
             action_log,
             cx,
         );
@@ -1356,9 +1366,12 @@ impl Thread {
             depth: parent_thread.read(cx).depth() + 1,
         });
         thread.inherit_parent_settings(parent_thread, cx);
-        if let Some(subagent_model) = AgentSettings::get_global(cx).subagent_model.clone() {
+        let model_selection = model_selection
+            .cloned()
+            .or_else(|| AgentSettings::get_global(cx).subagent_model.clone());
+        if let Some(model_selection) = model_selection {
             thread.inherits_parent_model_settings = false;
-            thread.apply_model_selection(&subagent_model, cx);
+            thread.apply_model_selection(&model_selection, cx);
         }
         thread
     }
@@ -1368,7 +1381,7 @@ impl Thread {
         project_context: Entity<ProjectContext>,
         context_server_registry: Entity<ContextServerRegistry>,
         templates: Arc<Templates>,
-        model: Option<Arc<dyn LanguageModel>>,
+        model: Option<LanguageModel>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_internal(
@@ -1387,7 +1400,7 @@ impl Thread {
         project_context: Entity<ProjectContext>,
         context_server_registry: Entity<ContextServerRegistry>,
         templates: Arc<Templates>,
-        model: Option<Arc<dyn LanguageModel>>,
+        model: Option<LanguageModel>,
         action_log: Entity<ActionLog>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1407,7 +1420,7 @@ impl Thread {
             .as_ref()
             .and_then(|model| model.speed);
         let (prompt_capabilities_tx, prompt_capabilities_rx) =
-            watch::channel(Self::prompt_capabilities(model.as_deref()));
+            watch::channel(Self::prompt_capabilities(model.as_ref()));
         let model = match model {
             Some(model) => ThreadModel::Ready(model),
             None => Self::user_configured_model_selection(cx)
@@ -1495,7 +1508,7 @@ impl Thread {
         self.thinking_effort = selection.effort.clone();
         self.speed = selection.speed.filter(|_| model.supports_fast_mode());
         self.prompt_capabilities_tx
-            .send(Self::prompt_capabilities(Some(model.as_ref())))
+            .send(Self::prompt_capabilities(Some(&model)))
             .log_err();
         self.model = ThreadModel::Ready(model);
     }
@@ -1639,8 +1652,6 @@ impl Thread {
         let Some(tool) = tool else {
             // Tool not found (e.g., MCP server not connected after restart),
             // but still display the saved result if available.
-            // We need to send both ToolCall and ToolCallUpdate events because the UI
-            // only converts raw_output to displayable content in update_fields, not from_acp.
             stream
                 .sender
                 .unbounded_send(Ok(ThreadEvent::ToolCall(
@@ -1773,7 +1784,6 @@ impl Thread {
             saved_selection
                 .as_ref()
                 .and_then(|selection| registry.select_model(selection, cx))
-                .map(|configured| configured.model)
         });
 
         let model = match (resolved_saved_model, saved_selection) {
@@ -1781,16 +1791,14 @@ impl Thread {
             (None, Some(selection)) => ThreadModel::Unresolved(selection),
             (None, None) => Self::resolve_profile_model(&profile_id, cx)
                 .or_else(|| {
-                    LanguageModelRegistry::global(cx).update(cx, |registry, _cx| {
-                        registry.default_model().map(|model| model.model)
-                    })
+                    LanguageModelRegistry::global(cx)
+                        .update(cx, |registry, _cx| registry.default_model())
                 })
                 .map_or(ThreadModel::Unset, ThreadModel::Ready),
         };
 
-        let (prompt_capabilities_tx, prompt_capabilities_rx) = watch::channel(
-            Self::prompt_capabilities(model.as_model().map(|model| model.as_ref())),
-        );
+        let (prompt_capabilities_tx, prompt_capabilities_rx) =
+            watch::channel(Self::prompt_capabilities(model.as_model()));
 
         let action_log = cx.new(|_| ActionLog::new(project.clone()));
 
@@ -1998,7 +2006,7 @@ impl Thread {
         self.ui_scroll_position = position;
     }
 
-    pub fn model(&self) -> Option<&Arc<dyn LanguageModel>> {
+    pub fn model(&self) -> Option<&LanguageModel> {
         self.model.as_model()
     }
 
@@ -2008,18 +2016,13 @@ impl Thread {
 
     pub(crate) fn ensure_model(
         &mut self,
-        default_model: Option<&Arc<dyn LanguageModel>>,
+        default_model: Option<&LanguageModel>,
         cx: &mut Context<Self>,
     ) {
         let resolved = match &self.model {
             ThreadModel::Ready(_) => return,
-            ThreadModel::Unresolved(selection) => {
-                LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-                    registry
-                        .select_model(selection, cx)
-                        .map(|configured| configured.model)
-                })
-            }
+            ThreadModel::Unresolved(selection) => LanguageModelRegistry::global(cx)
+                .update(cx, |registry, cx| registry.select_model(selection, cx)),
             ThreadModel::Unset => default_model.cloned(),
         };
 
@@ -2028,10 +2031,10 @@ impl Thread {
         }
     }
 
-    pub fn set_model(&mut self, model: Arc<dyn LanguageModel>, cx: &mut Context<Self>) {
+    pub fn set_model(&mut self, model: LanguageModel, cx: &mut Context<Self>) {
         let old_usage = self.latest_token_usage();
         self.model = ThreadModel::Ready(model.clone());
-        let new_caps = Self::prompt_capabilities(self.model.as_model().map(|model| model.as_ref()));
+        let new_caps = Self::prompt_capabilities(self.model.as_model());
         let new_usage = self.latest_token_usage();
         if old_usage != new_usage {
             cx.emit(TokenUsageUpdated(new_usage));
@@ -2052,13 +2055,37 @@ impl Thread {
         cx.notify()
     }
 
-    pub fn summarization_model(&self) -> Option<&Arc<dyn LanguageModel>> {
+    /// Re-selects this thread's model from its provider when that provider's
+    /// state changes, so names and capabilities that update after a model is
+    /// created (e.g. a local model finishing loading) reach the thread.
+    pub fn refresh_model(&mut self, provider_id: &LanguageModelProviderId, cx: &mut Context<Self>) {
+        let Some(current) = self.model() else {
+            return;
+        };
+        if &current.provider_id != provider_id {
+            return;
+        }
+        let Some(model) = LanguageModelRegistry::read_global(cx)
+            .provider(provider_id)
+            .into_iter()
+            .flat_map(|provider| provider.provided_models(cx))
+            .find(|model| model.id == current.id)
+        else {
+            return;
+        };
+        if model == *current {
+            return;
+        }
+        self.set_model(model, cx);
+    }
+
+    pub fn summarization_model(&self) -> Option<&LanguageModel> {
         self.summarization_model.as_ref()
     }
 
     pub fn set_summarization_model(
         &mut self,
-        model: Option<Arc<dyn LanguageModel>>,
+        model: Option<LanguageModel>,
         cx: &mut Context<Self>,
     ) {
         self.summarization_model = model.clone();
@@ -2484,7 +2511,7 @@ impl Thread {
     fn resolve_profile_model(
         profile_id: &AgentProfileId,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<dyn LanguageModel>> {
+    ) -> Option<LanguageModel> {
         let selection = AgentSettings::get_global(cx)
             .profiles
             .get(profile_id)?
@@ -2511,16 +2538,13 @@ impl Thread {
     fn resolve_model_from_selection(
         selection: &LanguageModelSelection,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<dyn LanguageModel>> {
+    ) -> Option<LanguageModel> {
         let selected = SelectedModel {
             provider: LanguageModelProviderId::from(selection.provider.0.clone()),
             model: LanguageModelId::from(selection.model.clone()),
         };
-        LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-            registry
-                .select_model(&selected, cx)
-                .map(|configured| configured.model)
-        })
+        LanguageModelRegistry::global(cx)
+            .update(cx, |registry, cx| registry.select_model(&selected, cx))
     }
 
     pub fn resume(
@@ -2777,7 +2801,7 @@ impl Thread {
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
-        let mut refusal_fallback_model: Option<Arc<dyn LanguageModel>> = None;
+        let mut refusal_fallback_model: Option<LanguageModel> = None;
         loop {
             match Self::perform_compaction_if_needed(
                 this,
@@ -2860,15 +2884,16 @@ impl Thread {
             // mid-turn changes (e.g. the user switches model, toggles tools,
             // or changes profile) take effect between tool-call rounds.
             // If a refusal fallback is active, use that model instead.
-            let (model, request) = this.update(cx, |this, cx| {
+            let (model, provider, request) = this.update(cx, |this, cx| {
                 let model = refusal_fallback_model
                     .clone()
                     .or_else(|| this.model().cloned())
                     .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
+                let provider = LanguageModelRegistry::read_global(cx).provider_for_model(&model);
                 this.refresh_turn_tools(cx);
                 let request = this.build_completion_request(intent, cx)?;
                 this.current_request_token_usage = TokenUsage::default();
-                anyhow::Ok((model, request))
+                anyhow::Ok((model, provider, request))
             })??;
 
             telemetry::event!(
@@ -2885,7 +2910,11 @@ impl Thread {
 
             log::debug!("Calling model.stream_completion, attempt {}", attempt);
 
-            let (mut events, mut error) = match model.stream_completion(request, cx).await {
+            let events = match provider {
+                Ok(provider) => provider.stream_completion(&model, request, cx).await,
+                Err(error) => Err(error),
+            };
+            let (mut events, mut error) = match events {
                 Ok(events) => (events.fuse(), None),
                 Err(err) => (stream::empty().boxed().fuse(), Some(err)),
             };
@@ -3010,8 +3039,10 @@ impl Thread {
             })?;
 
             if had_refusal {
-                let maybe_fallback = this.update(cx, |this, cx| -> Option<Arc<dyn LanguageModel>> {
-                    let current_model = refusal_fallback_model.as_ref().or(this.model())?;
+                let maybe_fallback = this.update(cx, |this, cx| -> Option<LanguageModel> {
+                    let current_model = refusal_fallback_model
+                        .as_ref()
+                        .or(this.model())?;
                     let fallback_id = match current_model.refusal_fallback_model_id() {
                         Some(id) => id,
                         None => {
@@ -3194,7 +3225,7 @@ impl Thread {
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
         mut cancellation_rx: watch::Receiver<bool>,
-        model: Arc<dyn LanguageModel>,
+        model: LanguageModel,
         request: LanguageModelRequest,
         insertion: CompactionInsertion,
         cx: &mut AsyncApp,
@@ -3210,8 +3241,10 @@ impl Thread {
             acp_thread::ContextCompactionStatus::InProgress,
         );
         let result: Result<ControlFlow<()>> = async {
+            let provider =
+                cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
             let stream = futures::select! {
-                result = model.stream_completion(request, cx).fuse() => result,
+                result = provider.stream_completion(&model, request, cx).fuse() => result,
                 _ = cancellation_rx.changed().fuse() => {
                     if *cancellation_rx.borrow() {
                         log::debug!("Compaction cancelled before request started");
@@ -3906,7 +3939,13 @@ impl Thread {
         let task = cx
             .spawn(async move |this, cx| {
                 let mut summary = String::new();
-                let mut messages = model.stream_completion(request, cx).await.log_err()?;
+                let provider = cx
+                    .update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))
+                    .log_err()?;
+                let mut messages = provider
+                    .stream_completion(&model, request, cx)
+                    .await
+                    .log_err()?;
                 while let Some(event) = messages.next().await {
                     let event = event.log_err()?;
                     let text = match event {
@@ -3969,7 +4008,7 @@ impl Thread {
 
     fn spawn_title_generation(
         &mut self,
-        model: Arc<dyn LanguageModel>,
+        model: LanguageModel,
         on_generated_title: Option<Box<dyn FnOnce(SharedString, &mut Context<Self>)>>,
         cx: &mut Context<Self>,
     ) {
@@ -4154,6 +4193,7 @@ impl Thread {
 
         let request = LanguageModelRequest {
             thread_id: Some(self.id.to_string()),
+            prompt_cache_key: None,
             prompt_id: Some(self.prompt_id.to_string()),
             intent: Some(completion_intent),
             messages,
@@ -4444,7 +4484,7 @@ impl Thread {
     fn build_compaction_telemetry(
         &self,
         trigger: &'static str,
-        compaction_model: &Arc<dyn LanguageModel>,
+        compaction_model: &LanguageModel,
         cx: &App,
     ) -> Option<CompactionTelemetry> {
         let model = self.model()?;
@@ -4459,8 +4499,8 @@ impl Thread {
             thread_id: self.id.to_string(),
             parent_thread_id: self.parent_thread_id().map(|id| id.to_string()),
             prompt_id: self.prompt_id.to_string(),
-            model: model.telemetry_id(),
-            compaction_model: compaction_model.telemetry_id(),
+            model: model.telemetry_id.to_string(),
+            compaction_model: compaction_model.telemetry_id.to_string(),
             thinking_effort: self.thinking_effort.clone(),
             max_tokens,
             tokens_before,
@@ -4545,17 +4585,16 @@ impl Thread {
         Some(self.messages.len())
     }
 
-    fn compaction_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
+    fn compaction_model(&self, cx: &App) -> Option<LanguageModel> {
         LanguageModelRegistry::read_global(cx)
             .compaction_model()
-            .map(|m| m.model)
             .or_else(|| self.model().cloned())
     }
 
     fn build_compaction_request(
         &self,
         insertion_ix: usize,
-        model: &Arc<dyn LanguageModel>,
+        model: &LanguageModel,
         cx: &App,
     ) -> Result<LanguageModelRequest> {
         let mut request = LanguageModelRequest {
@@ -4633,6 +4672,8 @@ impl Thread {
             // Retrying won't help until the user consents to data retention
             // or switches models.
             DataRetentionConsentRequired { .. } => None,
+            // Retrying won't help until the thread picks another model.
+            ModelUnavailable { .. } => None,
             // `Other` includes mid-stream mapping failures that can be caused by
             // a transient malformed or interrupted provider event.
             Other(..) => Some(RetryStrategy::FixedDelay {
@@ -5005,12 +5046,14 @@ pub fn build_thread_title_request(
 }
 
 pub async fn stream_thread_title(
-    model: Arc<dyn LanguageModel>,
+    model: LanguageModel,
     request: LanguageModelRequest,
     cx: &AsyncApp,
 ) -> Result<String> {
     let mut title = String::new();
-    let mut events = model.stream_completion(request, cx).await?;
+    let provider =
+        cx.update(|cx| LanguageModelRegistry::read_global(cx).provider_for_model(&model))?;
+    let mut events = provider.stream_completion(&model, request, cx).await?;
     while let Some(event) = events.next().await {
         let LanguageModelCompletionEvent::Text(text) = event? else {
             continue;
@@ -6983,7 +7026,7 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use language_model::LanguageModelToolUseId;
-    use language_model::fake_provider::FakeLanguageModel;
+    use language_model::fake_provider::FakeLanguageModelProvider;
     use serde_json::json;
     use settings::LanguageModelProviderSetting;
     use std::sync::Arc;
@@ -7012,12 +7055,18 @@ mod tests {
         );
     }
 
-    async fn setup_thread_for_test(cx: &mut TestAppContext) -> (Entity<Thread>, ThreadEventStream) {
-        cx.update(|cx| {
+    async fn setup_thread_for_test(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Thread>,
+        ThreadEventStream,
+        Arc<FakeLanguageModelProvider>,
+    ) {
+        let fake = cx.update(|cx| {
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
 
-            LanguageModelRegistry::test(cx);
+            LanguageModelRegistry::test(cx)
         });
 
         let fs = fs::FakeFs::new(cx.background_executor.clone());
@@ -7044,7 +7093,7 @@ mod tests {
             let (event_tx, _event_rx) = mpsc::unbounded();
             let event_stream = ThreadEventStream::new(event_tx);
 
-            (thread, event_stream)
+            (thread, event_stream, fake)
         })
     }
 
@@ -7054,16 +7103,9 @@ mod tests {
         AgentSettings::override_global(settings, cx);
     }
 
-    fn set_registry_compaction_model(cx: &mut App, model: Option<Arc<dyn LanguageModel>>) {
-        use language_model::fake_provider::FakeLanguageModelProvider;
-        use language_model::{ConfiguredModel, LanguageModelProvider};
+    fn set_registry_compaction_model(cx: &mut App, model: Option<LanguageModel>) {
         LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
-            let configured = model.map(|m| ConfiguredModel {
-                provider: Arc::new(FakeLanguageModelProvider::default())
-                    as Arc<dyn LanguageModelProvider>,
-                model: m,
-            });
-            registry.set_compaction_model(configured, cx);
+            registry.set_compaction_model(model, cx);
         });
     }
 
@@ -7254,9 +7296,9 @@ mod tests {
 
     #[gpui::test]
     async fn test_thread_summary_request_uses_compacted_history(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         let thread_id = thread.read_with(cx, |thread, _| thread.id().to_string());
-        let summary_model = Arc::new(FakeLanguageModel::default());
+        let summary_model = fake.model("summary");
 
         let summary_task = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
@@ -7284,7 +7326,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let summary_request = summary_model.pending_completions().pop().unwrap();
+        let summary_request = fake.pending_completions().pop().unwrap();
         assert_eq!(
             summary_request.thread_id.as_deref(),
             Some(thread_id.as_str())
@@ -7305,8 +7347,8 @@ mod tests {
             ]
         );
 
-        summary_model.send_completion_stream_text_chunk(&summary_request, "thread summary");
-        summary_model.end_completion_stream(&summary_request);
+        fake.send_text(&summary_model, &summary_request, "thread summary");
+        fake.end_stream(&summary_model, &summary_request);
         assert_eq!(summary_task.await.as_deref(), Some("thread summary"));
     }
 
@@ -7344,13 +7386,13 @@ mod tests {
 
     #[gpui::test]
     async fn test_compaction_threshold_uses_percentage_setting(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                thread.set_model(model, cx);
+                thread.set_model(model.clone(), cx);
                 thread
                     .messages
                     .push(user_text_message(user_message_id.clone(), "below limit"));
@@ -7379,14 +7421,13 @@ mod tests {
 
     #[gpui::test]
     async fn test_compaction_threshold_accounts_for_max_output_tokens(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
-        model.set_max_output_tokens(Some(32_000));
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| model.max_output_tokens = Some(32_000));
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                thread.set_model(model, cx);
+                thread.set_model(model.clone(), cx);
                 thread.messages.push(user_text_message(
                     user_message_id.clone(),
                     "near input limit",
@@ -7443,12 +7484,12 @@ mod tests {
 
     #[gpui::test]
     async fn test_compaction_threshold_respects_independent_input_limit(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let mut model = FakeLanguageModel::default();
-        model.set_max_token_count(200_000);
-        model.set_max_input_tokens(90_000);
-        model.set_max_output_tokens(Some(16_384));
-        let model = Arc::new(model);
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = 200_000;
+            model.max_input_tokens = 90_000;
+            model.max_output_tokens = Some(16_384);
+        });
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
@@ -7460,7 +7501,7 @@ mod tests {
                 },
             );
             thread.update(cx, |thread, cx| {
-                thread.set_model(model, cx);
+                thread.set_model(model.clone(), cx);
                 thread.messages.push(user_text_message(
                     user_message_id.clone(),
                     "near the independent input limit",
@@ -7484,8 +7525,8 @@ mod tests {
 
     #[gpui::test]
     async fn test_compaction_threshold_respects_enabled_setting(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
@@ -7497,7 +7538,7 @@ mod tests {
                 },
             );
             thread.update(cx, |thread, cx| {
-                thread.set_model(model, cx);
+                thread.set_model(model.clone(), cx);
                 thread
                     .messages
                     .push(user_text_message(user_message_id.clone(), "near limit"));
@@ -7516,8 +7557,8 @@ mod tests {
 
     #[gpui::test]
     async fn test_compaction_threshold_respects_token_settings(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
@@ -7529,7 +7570,7 @@ mod tests {
                 },
             );
             thread.update(cx, |thread, cx| {
-                thread.set_model(model, cx);
+                thread.set_model(model.clone(), cx);
                 thread.messages.push(user_text_message(
                     user_message_id.clone(),
                     "fixed token limit",
@@ -7586,15 +7627,17 @@ mod tests {
 
     #[gpui::test]
     async fn test_compaction_unavailable_for_small_context_window(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         // A context window below the minimum disables auto-compaction.
-        model.set_max_token_count(MIN_COMPACTION_CONTEXT_WINDOW - 1);
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = MIN_COMPACTION_CONTEXT_WINDOW - 1;
+            model.max_input_tokens = MIN_COMPACTION_CONTEXT_WINDOW - 1;
+        });
         let user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
-                thread.set_model(model, cx);
+                thread.set_model(model.clone(), cx);
                 thread
                     .messages
                     .push(user_text_message(user_message_id.clone(), "near limit"));
@@ -7615,8 +7658,8 @@ mod tests {
     async fn test_compaction_inserts_before_new_user_and_requests_compacted_window(
         cx: &mut TestAppContext,
     ) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
         let old_user_message_id = ClientUserMessageId::new();
         let new_user_message_id = ClientUserMessageId::new();
 
@@ -7646,7 +7689,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        let compaction_request = model.pending_completions().pop().unwrap();
+        let compaction_request = fake.pending_completions().pop().unwrap();
         assert_eq!(
             compaction_request.intent,
             Some(CompletionIntent::ThreadContextSummarization)
@@ -7657,11 +7700,11 @@ mod tests {
         assert_eq!(compaction_texts[1], "old assistant");
         assert_eq!(compaction_texts[2], COMPACTION_PROMPT);
 
-        model.send_completion_stream_text_chunk(&compaction_request, "compacted old context");
-        model.end_completion_stream(&compaction_request);
+        fake.send_text(&model, &compaction_request, "compacted old context");
+        fake.end_stream(&model, &compaction_request);
         cx.run_until_parked();
 
-        let final_request = model.pending_completions().pop().unwrap();
+        let final_request = fake.pending_completions().pop().unwrap();
         assert_eq!(final_request.intent, Some(CompletionIntent::UserPrompt));
         assert_eq!(
             request_texts_after_system(&final_request.messages),
@@ -7672,8 +7715,8 @@ mod tests {
             ]
         );
 
-        model.send_completion_stream_text_chunk(&final_request, "answer");
-        model.end_completion_stream(&final_request);
+        fake.send_text(&model, &final_request, "answer");
+        fake.end_stream(&model, &final_request);
         cx.run_until_parked();
 
         cx.update(|cx| {
@@ -7691,11 +7734,13 @@ mod tests {
 
     #[gpui::test]
     async fn test_manual_compact_forces_summary(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
         // A context window below the minimum and no recorded token usage would
         // both disable *automatic* compaction. Manual compaction forces it anyway.
-        model.set_max_token_count(MIN_COMPACTION_CONTEXT_WINDOW - 1);
+        let model = fake.update_model("fake", |model| {
+            model.max_token_count = MIN_COMPACTION_CONTEXT_WINDOW - 1;
+            model.max_input_tokens = MIN_COMPACTION_CONTEXT_WINDOW - 1;
+        });
         let user_message_id = ClientUserMessageId::new();
         let compact_message_id = ClientUserMessageId::new();
 
@@ -7720,7 +7765,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        let compaction_request = model.pending_completions().pop().unwrap();
+        let compaction_request = fake.pending_completions().pop().unwrap();
         assert_eq!(
             compaction_request.intent,
             Some(CompletionIntent::ThreadContextSummarization)
@@ -7731,14 +7776,14 @@ mod tests {
         assert_eq!(compaction_texts[1], "old assistant");
         assert_eq!(compaction_texts[2], COMPACTION_PROMPT);
 
-        model.send_completion_stream_text_chunk(&compaction_request, "summary of old context");
-        model.end_completion_stream(&compaction_request);
+        fake.send_text(&model, &compaction_request, "summary of old context");
+        fake.end_stream(&model, &compaction_request);
         cx.run_until_parked();
 
         // The compaction summary is appended after a zero-content user message
         // marker, and no follow-up model turn is requested — `/compact` only
         // compacts.
-        assert!(model.pending_completions().is_empty());
+        assert!(fake.pending_completions().is_empty());
         cx.update(|cx| {
             thread.read_with(cx, |thread, _cx| {
                 assert!(matches!(&*thread.messages[0], Message::User(_)));
@@ -7772,8 +7817,8 @@ mod tests {
     /// rewind marker (or a partial summary) dangling at the end of the thread.
     #[gpui::test]
     async fn test_manual_compact_cancelled_leaves_no_marker(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
@@ -7794,7 +7839,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         // The compaction request is in flight but hasn't streamed a summary.
-        assert_eq!(model.pending_completions().len(), 1);
+        assert_eq!(fake.pending_completions().len(), 1);
 
         cx.update(|cx| thread.update(cx, |thread, cx| thread.cancel(cx)))
             .await;
@@ -7811,8 +7856,8 @@ mod tests {
     /// the thread untouched — no marker, no compaction.
     #[gpui::test]
     async fn test_manual_compact_empty_summary_leaves_no_marker(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
@@ -7833,9 +7878,9 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        let request = model.pending_completions().pop().unwrap();
+        let request = fake.pending_completions().pop().unwrap();
         // End the stream without emitting any summary text.
-        model.end_completion_stream(&request);
+        fake.end_stream(&model, &request);
         cx.run_until_parked();
 
         // An error is surfaced, and the thread is left exactly as it was. The
@@ -7859,8 +7904,8 @@ mod tests {
     /// issues no model request and adds no marker.
     #[gpui::test]
     async fn test_manual_compact_noop_on_empty_thread(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
         cx.update(|cx| thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx)));
 
         let _events = cx
@@ -7872,7 +7917,7 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        assert!(model.pending_completions().is_empty());
+        assert!(fake.pending_completions().is_empty());
         thread.read_with(cx, |thread, _cx| {
             assert!(thread.messages.is_empty());
         });
@@ -7883,7 +7928,7 @@ mod tests {
     /// a compacted thread doesn't surface an empty `/compact` bubble.
     #[gpui::test]
     async fn test_manual_compact_marker_replays_as_empty_user_message(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
         let marker_id = ClientUserMessageId::new();
 
         let mut replay_events = cx.update(|cx| {
@@ -7928,9 +7973,9 @@ mod tests {
     /// to the configured model rather than the thread's primary model.
     #[gpui::test]
     async fn test_compaction_uses_configured_compaction_model(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let thread_model = Arc::new(FakeLanguageModel::default());
-        let compaction_model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let thread_model = fake.model("fake");
+        let compaction_model = fake.model("compaction");
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
@@ -7940,7 +7985,8 @@ mod tests {
                     .push(user_text_message(ClientUserMessageId::new(), "old user"));
                 thread.messages.push(agent_text_message("old assistant"));
             });
-            set_registry_compaction_model(cx, Some(compaction_model.clone()));
+            let compaction_model = compaction_model.clone();
+            set_registry_compaction_model(cx, Some(compaction_model));
         });
 
         let _events = cx
@@ -7953,12 +7999,12 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(
-            thread_model.pending_completions().len(),
+            fake.pending_completions_for(&thread_model).len(),
             0,
             "thread's primary model should not have been used for compaction"
         );
-        let request = compaction_model
-            .pending_completions()
+        let request = fake
+            .pending_completions_for(&compaction_model)
             .pop()
             .expect("compaction model should have received the request");
         assert_eq!(
@@ -7974,8 +8020,8 @@ mod tests {
             assert_eq!(telemetry.model, compaction_model.telemetry_id());
         });
 
-        compaction_model.send_completion_stream_text_chunk(&request, "summary");
-        compaction_model.end_completion_stream(&request);
+        fake.send_text(&compaction_model, &request, "summary");
+        fake.end_stream(&compaction_model, &request);
         cx.run_until_parked();
     }
 
@@ -7985,8 +8031,8 @@ mod tests {
     /// model — not the one the user tried to configure.
     #[gpui::test]
     async fn test_compaction_falls_back_when_compaction_model_unavailable(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let thread_model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let thread_model = fake.model("fake");
 
         cx.update(|cx| {
             thread.update(cx, |thread, cx| {
@@ -8018,8 +8064,8 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        let request = thread_model
-            .pending_completions()
+        let request = fake
+            .pending_completions_for(&thread_model)
             .pop()
             .expect("thread model should have received the fallback request");
         assert_eq!(
@@ -8035,8 +8081,8 @@ mod tests {
             assert_eq!(telemetry.model, thread_model.telemetry_id());
         });
 
-        thread_model.send_completion_stream_text_chunk(&request, "summary");
-        thread_model.end_completion_stream(&request);
+        fake.send_text(&thread_model, &request, "summary");
+        fake.end_stream(&thread_model, &request);
         cx.run_until_parked();
     }
 
@@ -8044,9 +8090,9 @@ mod tests {
     /// `agent.compaction_model`.
     #[gpui::test]
     async fn test_auto_compaction_uses_compaction_model(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let thread_model = Arc::new(FakeLanguageModel::default());
-        let compaction_model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let thread_model = fake.model("fake");
+        let compaction_model = fake.model("compaction");
         let old_user_message_id = ClientUserMessageId::new();
 
         cx.update(|cx| {
@@ -8071,7 +8117,8 @@ mod tests {
                     threshold: agent_settings::AutoCompactThreshold::Percentage(0.5),
                 },
             );
-            set_registry_compaction_model(cx, Some(compaction_model.clone()));
+            let compaction_model = compaction_model.clone();
+            set_registry_compaction_model(cx, Some(compaction_model));
         });
 
         // The auto-compact gate fires inside `run_turn` when we kick off a
@@ -8086,9 +8133,9 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        assert_eq!(thread_model.pending_completions().len(), 0);
-        let request = compaction_model
-            .pending_completions()
+        assert_eq!(fake.pending_completions_for(&thread_model).len(), 0);
+        let request = fake
+            .pending_completions_for(&compaction_model)
             .pop()
             .expect("compaction model should have received the auto-compaction request");
         assert_eq!(
@@ -8096,15 +8143,15 @@ mod tests {
             Some(CompletionIntent::ThreadContextSummarization)
         );
 
-        compaction_model.send_completion_stream_text_chunk(&request, "summary");
-        compaction_model.end_completion_stream(&request);
+        fake.send_text(&compaction_model, &request, "summary");
+        fake.end_stream(&compaction_model, &request);
         cx.run_until_parked();
     }
 
     #[gpui::test]
     async fn test_compaction_usage_counts_toward_cumulative_usage(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
-        let model = Arc::new(FakeLanguageModel::default());
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
         let old_user_message_id = ClientUserMessageId::new();
         let new_user_message_id = ClientUserMessageId::new();
         let prior_usage = TokenUsage {
@@ -8148,13 +8195,14 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
 
-        let compaction_request = model.pending_completions().pop().unwrap();
+        let compaction_request = fake.pending_completions().pop().unwrap();
         assert_eq!(
             compaction_request.intent,
             Some(CompletionIntent::ThreadContextSummarization)
         );
 
-        model.send_completion_stream_event(
+        fake.send_event(
+            &model,
             &compaction_request,
             LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
                 input_tokens: 40,
@@ -8162,12 +8210,13 @@ mod tests {
                 ..Default::default()
             }),
         );
-        model.send_completion_stream_event(
+        fake.send_event(
+            &model,
             &compaction_request,
             LanguageModelCompletionEvent::UsageUpdate(compaction_usage),
         );
-        model.send_completion_stream_text_chunk(&compaction_request, "compacted old context");
-        model.end_completion_stream(&compaction_request);
+        fake.send_text(&model, &compaction_request, "compacted old context");
+        fake.end_stream(&model, &compaction_request);
         cx.run_until_parked();
 
         let expected_after_compaction = prior_usage + compaction_usage;
@@ -8180,14 +8229,15 @@ mod tests {
             );
         });
 
-        let final_request = model.pending_completions().pop().unwrap();
+        let final_request = fake.pending_completions().pop().unwrap();
         assert_eq!(final_request.intent, Some(CompletionIntent::UserPrompt));
 
-        model.send_completion_stream_event(
+        fake.send_event(
+            &model,
             &final_request,
             LanguageModelCompletionEvent::UsageUpdate(final_usage),
         );
-        model.end_completion_stream(&final_request);
+        fake.end_stream(&model, &final_request);
         cx.run_until_parked();
 
         thread.read_with(cx, |thread, _cx| {
@@ -8204,7 +8254,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_replay_emits_context_compaction(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
         let user_message_id = ClientUserMessageId::new();
 
         let mut replay_events = cx.update(|cx| {
@@ -8253,7 +8303,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_native_compaction_boundary(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
 
         let request_messages = cx.update(|cx| {
             thread.update(cx, |thread, cx| {
@@ -8286,7 +8336,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_retained_users_truncate_oldest(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
         let mut long_text = "START".to_string();
         long_text.push_str(&"x".repeat(COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET));
         long_text.push_str("END");
@@ -8387,7 +8437,7 @@ mod tests {
         cx.update(|cx| {
             let mut subagents = Vec::new();
             for _ in 0..count {
-                let subagent = cx.new(|cx| Thread::new_subagent(parent, cx));
+                let subagent = cx.new(|cx| Thread::new_subagent(parent, None, cx));
                 parent.update(cx, |thread, _cx| {
                     thread.register_running_subagent(subagent.downgrade());
                 });
@@ -8885,7 +8935,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_replay_tool_call_replays_image_content(cx: &mut TestAppContext) {
-        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let (thread, _event_stream, _) = setup_thread_for_test(cx).await;
 
         let registered_tool_use_id = LanguageModelToolUseId::from("registered_tool_id");
         let missing_tool_use_id = LanguageModelToolUseId::from("missing_tool_id");
@@ -9002,20 +9052,43 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_refresh_model_picks_up_provider_capability_changes(cx: &mut TestAppContext) {
+        let (thread, _event_stream, fake) = setup_thread_for_test(cx).await;
+        let model = fake.model("fake");
+        let provider_id = model.provider_id.clone();
+        let model_changes = Rc::new(std::cell::Cell::new(0));
+        let _subscription = cx.update(|cx| {
+            thread.update(cx, |thread, cx| thread.set_model(model, cx));
+            let model_changes = model_changes.clone();
+            cx.subscribe(&thread, move |_, _: &ModelChanged, _| {
+                model_changes.set(model_changes.get() + 1)
+            })
+        });
+
+        thread.update(cx, |thread, cx| thread.refresh_model(&provider_id, cx));
+        assert_eq!(model_changes.get(), 0, "an unchanged model is not re-set");
+
+        fake.update_model("fake", |model| model.supports_images = true);
+        thread.update(cx, |thread, cx| {
+            thread.refresh_model(&LanguageModelProviderId::from("other".to_string()), cx);
+            assert!(!thread.model().unwrap().supports_images());
+
+            thread.refresh_model(&provider_id, cx);
+            assert!(thread.model().unwrap().supports_images());
+        });
+        assert_eq!(model_changes.get(), 1);
+    }
+
+    #[gpui::test]
     async fn test_set_model_propagates_to_subagents(cx: &mut TestAppContext) {
-        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let (parent, _event_stream, fake) = setup_thread_for_test(cx).await;
         let subagents = setup_parent_with_subagents(cx, &parent, 2);
 
-        let new_model: Arc<dyn LanguageModel> = Arc::new(FakeLanguageModel::with_id_and_thinking(
-            "test-provider",
-            "new-model",
-            "New Model",
-            false,
-        ));
+        let new_model = fake.model("new-model");
 
         cx.update(|cx| {
             parent.update(cx, |thread, cx| {
-                thread.set_model(new_model, cx);
+                thread.set_model(new_model.clone(), cx);
             });
 
             for subagent in &subagents {
@@ -9031,20 +9104,14 @@ mod tests {
 
     #[gpui::test]
     async fn test_set_summarization_model_propagates_to_subagents(cx: &mut TestAppContext) {
-        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let (parent, _event_stream, fake) = setup_thread_for_test(cx).await;
         let subagents = setup_parent_with_subagents(cx, &parent, 2);
 
-        let summary_model: Arc<dyn LanguageModel> =
-            Arc::new(FakeLanguageModel::with_id_and_thinking(
-                "test-provider",
-                "summary-model",
-                "Summary Model",
-                false,
-            ));
+        let summary_model = fake.model("summary-model");
 
         cx.update(|cx| {
             parent.update(cx, |thread, cx| {
-                thread.set_summarization_model(Some(summary_model), cx);
+                thread.set_summarization_model(Some(summary_model.clone()), cx);
             });
 
             for subagent in &subagents {
@@ -9060,7 +9127,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_set_thinking_enabled_propagates_to_subagents(cx: &mut TestAppContext) {
-        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let (parent, _event_stream, _) = setup_thread_for_test(cx).await;
         let subagents = setup_parent_with_subagents(cx, &parent, 2);
 
         cx.update(|cx| {
@@ -9090,7 +9157,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_set_thinking_effort_propagates_to_subagents(cx: &mut TestAppContext) {
-        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let (parent, _event_stream, _) = setup_thread_for_test(cx).await;
         let subagents = setup_parent_with_subagents(cx, &parent, 2);
 
         cx.update(|cx| {
@@ -9122,7 +9189,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_subagent_inherits_settings_at_creation(cx: &mut TestAppContext) {
-        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let (parent, _event_stream, _) = setup_thread_for_test(cx).await;
 
         cx.update(|cx| {
             parent.update(cx, |thread, cx| {
@@ -9146,7 +9213,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_set_speed_propagates_to_subagents(cx: &mut TestAppContext) {
-        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let (parent, _event_stream, _) = setup_thread_for_test(cx).await;
         let subagents = setup_parent_with_subagents(cx, &parent, 2);
 
         cx.update(|cx| {
@@ -9166,7 +9233,7 @@ mod tests {
 
     #[gpui::test]
     async fn test_dropped_subagent_does_not_panic(cx: &mut TestAppContext) {
-        let (parent, _event_stream) = setup_thread_for_test(cx).await;
+        let (parent, _event_stream, _) = setup_thread_for_test(cx).await;
         let subagents = setup_parent_with_subagents(cx, &parent, 1);
 
         // Drop the subagent so the WeakEntity can no longer be upgraded
@@ -9186,7 +9253,7 @@ mod tests {
     async fn test_handle_tool_use_json_parse_error_adds_tool_use_to_content(
         cx: &mut TestAppContext,
     ) {
-        let (thread, event_stream) = setup_thread_for_test(cx).await;
+        let (thread, event_stream, _) = setup_thread_for_test(cx).await;
 
         let tool_use_id = LanguageModelToolUseId::from("test_tool_id");
         let tool_name: Arc<str> = Arc::from("test_tool");
