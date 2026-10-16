@@ -1,0 +1,28 @@
+name: Zeed PR checks
+
+on:
+  push:
+    branches:
+      - zeed/dev
+  pull_request:
+    branches:
+      - zeed/release
+
+permissions:
+  contents: read
+
+jobs:
+  rust-format:
+    name: Rust formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
